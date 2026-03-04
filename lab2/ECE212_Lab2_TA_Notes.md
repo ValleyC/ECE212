@@ -249,14 +249,33 @@ Trapezoidal rule:
                     k=0
 
     where dx_k = x[k+1] - x[k]  ∈ {1, 2, 4}
-
-Implementation (Method 2 — accumulate then halve):
-  1. For each trapezoid k = 0..N-2:
-       term = (y[k+1] + y[k]) * dx_k     ← multiply via LSL
-       accumulator += term
-  2. result = accumulator / 2             ← divide via LSR
-  3. if accumulator was odd, result += 1  ← round up
 ```
+
+**Why not just accumulate `dx * sum_y` then divide by 2?**
+
+The naive approach (`LSL #2` for dx=4, then `LSR #1` at the end) overflows
+for extreme values. Example: `0xC0000000 << 2 = 0x00000000` (bits lost).
+
+**Correct approach — fold the `/2` into the multiplication per iteration:**
+
+```
+  dx=1 → net factor = 1/2    → defer: accumulate raw, divide at end
+  dx=2 → net factor = 2/2 =1 → add sum_y directly (no shift)
+  dx=4 → net factor = 4/2 =2 → add sum_y << 1  (LSL #1, not #2!)
+
+Two accumulators:
+  accum_raw  — for dx=1 pairs (still needs /2 at end)
+  accum_done — for dx=2,4 pairs (already at final scale)
+
+Finalize:
+  remainder  = accum_raw AND 1
+  accum_raw  = accum_raw ASR 1     ← ASR (signed!), NOT LSR
+  result     = accum_done + accum_raw + remainder
+```
+
+> **Critical**: Use **ASR** (arithmetic shift right), not LSR, for the
+> final division. LSR fills the top bit with 0, turning negative results
+> positive. ASR preserves the sign bit.
 
 ### Full file
 
@@ -282,19 +301,22 @@ PUSH {lr}
     @  [r0+0]  = N            (number of data points)
     @  [r0+4]  = addr of X    (X data array)
     @  [r0+8]  = addr of Y    (Y data array)
-    @  [r0+12] = addr temp    (scratch memory)
+    @  [r0+12] = addr temp    (scratch memory, unused here)
     @  [r0+16] = addr final   (store result here)
     @
     ldr  r0, =0x20001000
     ldr  r7, [r0]             @ r7 = N (number of data points)
     ldr  r1, [r0, #4]         @ r1 = pointer to X data
     ldr  r2, [r0, #8]         @ r2 = pointer to Y data
-    ldr  r3, [r0, #12]        @ r3 = temp storage address
     ldr  r4, [r0, #16]        @ r4 = final value address
 
-    @ --- Initialize accumulator at temp to 0 ---
-    movs r5, #0
-    str  r5, [r3]             @ *temp = 0
+    @ --- Initialize two accumulators ---
+    @
+    @  r8 = accum_raw   (for dx=1: stores raw Σ sum_y, needs /2 at end)
+    @  r9 = accum_done  (for dx≥2: stores area at final scale)
+    @
+    mov  r8, #0               @ accum_raw  = 0
+    mov  r9, #0               @ accum_done = 0
 
     @ --- Number of trapezoids = N - 1 ---
     sub  r7, r7, #1           @ r7 = loop counter
@@ -304,11 +326,13 @@ PUSH {lr}
     @ ==========================================================
     @
     @  For each pair (k, k+1):
-    @    1. dx  = x[k+1] - x[k]          → r6
-    @    2. sum = y[k]   + y[k+1]         → r5
-    @    3. Multiply sum by dx via LSL    → r5
-    @    4. Accumulate into temp memory
-    @    5. Advance r1, r2 by 4
+    @    1. dx  = x[k+1] - x[k]
+    @    2. sum_y = y[k] + y[k+1]
+    @    3. Route to correct accumulator based on dx:
+    @         dx=1 → accum_raw  += sum_y     (defer /2)
+    @         dx=2 → accum_done += sum_y     (net factor = 2/2 = 1)
+    @         dx=4 → accum_done += sum_y<<1  (net factor = 4/2 = 2)
+    @    4. Advance X, Y pointers by 4
     @
 TrapLoop:
 
@@ -319,34 +343,28 @@ TrapLoop:
 
     @ --- Step 2: compute y[k] + y[k+1] ---
     ldr  r5, [r2]             @ r5 = y[k]
-    ldr  r8, [r2, #4]         @ r8 = y[k+1]
-    add  r5, r5, r8           @ r5 = y[k] + y[k+1]
+    ldr  r10, [r2, #4]        @ r10 = y[k+1]
+    add  r5, r5, r10          @ r5 = sum_y
 
-    @ --- Step 3: multiply sum_y by dx ---
-    @
-    @  dx is guaranteed to be 1, 2, or 4.
-    @  MUL is forbidden — use LSL instead:
-    @    dx=1 → no shift (×1)
-    @    dx=2 → LSL #1   (×2)
-    @    dx=4 → LSL #2   (×4)
-    @
+    @ --- Step 3: route by dx ---
     cmp  r6, #1
-    beq  MultDone             @ dx=1: r5 already correct
+    beq  DxIs1
     cmp  r6, #2
-    beq  MultBy2
+    beq  DxIs2
     @ else dx=4
-    lsl  r5, r5, #2           @ r5 = sum_y × 4
-    b    MultDone
-MultBy2:
-    lsl  r5, r5, #1           @ r5 = sum_y × 2
-MultDone:
+    lsl  r5, r5, #1           @ sum_y × 2  (= dx/2 × sum_y)
+    add  r9, r9, r5           @ accum_done += sum_y*2
+    b    NextIter
 
-    @ --- Step 4: accumulate ---
-    ldr  r8, [r3]             @ r8 = running total (from temp)
-    add  r8, r8, r5           @ r8 += dx * sum_y
-    str  r8, [r3]             @ store back to temp
+DxIs1:
+    add  r8, r8, r5           @ accum_raw += sum_y  (still needs /2)
+    b    NextIter
 
-    @ --- Step 5: advance pointers ---
+DxIs2:
+    add  r9, r9, r5           @ accum_done += sum_y (dx/2=1, no shift)
+
+NextIter:
+    @ --- Step 4: advance pointers ---
     add  r1, r1, #4           @ X ptr → next point
     add  r2, r2, #4           @ Y ptr → next point
 
@@ -355,17 +373,17 @@ MultDone:
     bgt  TrapLoop             @ if counter > 0, repeat
 
     @ ==========================================================
-    @  FINALIZE — divide by 2 and round up
+    @  FINALIZE — divide accum_raw by 2 (ASR), combine
     @ ==========================================================
     @
-    @  We accumulated  Σ dx*(y[k]+y[k+1])  which is 2× the area.
-    @  Divide by 2 with LSR.  If the sum was odd (LSB=1),
-    @  that means there's a 0.5 remainder — round up by adding 1.
+    @  accum_raw holds Σ sum_y for dx=1 pairs (2× their area).
+    @  Divide by 2 with ASR (signed!).  If odd, round up.
+    @  accum_done already holds final-scale area for dx=2,4 pairs.
     @
-    ldr  r5, [r3]             @ r5 = raw accumulated total
-    and  r6, r5, #1           @ r6 = r5 & 1  (0 or 1 = remainder)
-    lsr  r5, r5, #1           @ r5 = total / 2  (truncated)
-    add  r5, r5, r6           @ r5 += remainder  (round up if odd)
+    and  r6, r8, #1           @ r6 = accum_raw & 1  (remainder)
+    asr  r8, r8, #1           @ r8 = accum_raw / 2  (signed)
+    add  r8, r8, r6           @ round up if odd
+    add  r5, r9, r8           @ r5 = accum_done + accum_raw_halved
 
     @ --- Store final result ---
     str  r5, [r4]             @ *final = area
@@ -385,75 +403,74 @@ POP {PC}
 r0  = 0x20001000 (opcode base, used only during setup)
 r1  = X data pointer          ← advances +4 each iteration
 r2  = Y data pointer          ← advances +4 each iteration
-r3  = temp storage address    (accumulator lives in memory here)
 r4  = final value address     (write result here at end)
 r5  = multi-purpose temp      (x[k], sum_y, shifted product, final result)
 r6  = dx / remainder
 r7  = loop counter            (N-1, decrements to 0)
-r8  = y[k+1] / running total (high register)
+r8  = accum_raw               (for dx=1 pairs; needs /2 at end)   [high reg]
+r9  = accum_done              (for dx≥2 pairs; already at final scale) [high reg]
+r10 = y[k+1]                  [high reg]
 ```
+
+> r3 (temp address from opcode[12]) is NOT used by this solution. The accumulators
+> live in registers r8/r9, which is faster than load/store through memory.
 
 ### Execution trace — DataStorage4 (first 3 iterations)
 
 ```
-Setup: N=51 → counter=50, X@0x20002000, Y@0x20003000, temp@0x20004000
-       *temp = 0
+Setup: N=51 → counter=50, X@0x20002000, Y@0x20003000
+       accum_raw=0, accum_done=0
 
 Iteration k=0:
   x[0]=0, x[1]=1   → dx=1
   y[0]=0, y[1]=1   → sum_y=1
-  dx=1 → no shift  → product=1
-  *temp = 0 + 1 = 1
+  dx=1 → accum_raw += 1  → accum_raw=1
 
 Iteration k=1:
   x[1]=1, x[2]=2   → dx=1
   y[1]=1, y[2]=4   → sum_y=5
-  dx=1 → no shift  → product=5
-  *temp = 1 + 5 = 6
+  dx=1 → accum_raw += 5  → accum_raw=6
 
 Iteration k=2:
   x[2]=2, x[3]=3   → dx=1
   y[2]=4, y[3]=9   → sum_y=13
-  dx=1 → no shift  → product=13
-  *temp = 6 + 13 = 19
+  dx=1 → accum_raw += 13 → accum_raw=19
 
-  ...  (47 more iterations)
+  ...  (all dx=1 for DS4)
 
-After loop: *temp = 83350
+After loop: accum_raw=83350, accum_done=0
   83350 & 1 = 0  → no remainder
-  83350 >> 1 = 41675
-  Result = 41675  ✓
+  83350 ASR 1 = 41675
+  Result = 0 + 41675 + 0 = 41675  ✓
 ```
 
 ### Execution trace — DataStorage6 (first 3 iterations, showing varying dx)
 
 ```
 Setup: N=51 → counter=50, X@0x20002000, Y@0x20003000
+       accum_raw=0, accum_done=0
 
 Iteration k=0:
   x[0]=0, x[1]=2   → dx=2
   y[0]=0, y[1]=4   → sum_y=4
-  dx=2 → LSL #1    → product=8
-  *temp = 0 + 8 = 8
+  dx=2 → accum_done += 4         → accum_done=4
 
 Iteration k=1:
   x[1]=2, x[2]=3   → dx=1
   y[1]=4, y[2]=9   → sum_y=13
-  dx=1 → no shift  → product=13
-  *temp = 8 + 13 = 21
+  dx=1 → accum_raw += 13         → accum_raw=13
 
 Iteration k=2:
   x[2]=3, x[3]=7   → dx=4
   y[2]=9, y[3]=49  → sum_y=58
-  dx=4 → LSL #2    → product=232
-  *temp = 21 + 232 = 253
+  dx=4 → accum_done += 58<<1=116 → accum_done=120
 
   ...
 
-After loop: *temp = 887686
-  887686 & 1 = 0  → no remainder
-  887686 >> 1 = 443843
-  Result = 443843  ✓
+After loop: accum_raw=143186, accum_done=372250
+  143186 & 1 = 0  → no remainder
+  143186 ASR 1 = 71593
+  Result = 372250 + 71593 + 0 = 443843  ✓
 ```
 
 ---
@@ -467,6 +484,92 @@ After loop: *temp = 887686
 | DataStorage6 | 51 | 0–110 | {1,2,4} | 887,686 | **443,843** | 443,666.667 | 0.040% |
 
 All test cases: **y = x²**, theoretical integral = x³/3.
+
+---
+
+## Part B — Extreme Demo Test Cases (Instructor-provided)
+
+These 3 test cases are used during the demo to catch subtle bugs.
+Files: `DataStorage4_Test1.s`, `DataStorage4_Test2.s`, `DataStorage4_Test3.s`
+
+### Test 1 — Rounding
+
+Same as DataStorage4 but **last Y changed from `0x9C4` to `0x9C5`** (2500 → 2501).
+
+```
+N=51, X=[0..50], dx=1, Y=[0², 1², ..., 49², 2501]
+
+accum_raw = 83350 - 4901 + 4902 = 83351   (last pair changes from 4901 to 4902)
+83351 & 1 = 1   → odd!
+83351 ASR 1 = 41675
+Result = 41675 + 1 = 41676    ← rounded up
+
+Expected output: 41676
+Wrong if student gets: 41675 (forgot rounding)
+```
+
+### Test 2 — Overflow / Signed Division
+
+```
+N=2, X=[0, 2], Y=[0, -2]          (Y[1] = 0xFFFFFFFE signed)
+
+dx=2 → accum_done += sum_y = 0 + 0xFFFFFFFE = 0xFFFFFFFE
+accum_raw = 0
+
+Result = 0xFFFFFFFE = -2
+
+Expected output: -2
+Wrong if student gets: 2147483646  (used LSR instead of ASR)
+```
+
+**What goes wrong with LSR:**
+```
+0xFFFFFFFE in binary: 1111...1110
+  LSR #1 →           0111...1111 = 0x7FFFFFFF = 2147483647  (positive!)
+  ASR #1 →           1111...1111 = 0xFFFFFFFF = -1
+
+Wait — in this solution accum_done already holds -2 at final scale (dx=2, net factor=1).
+No final division needed for accum_done. Result = -2 directly.  ✓
+
+But with the naive single-accumulator approach:
+  raw = dx * sum_y = 2 * (-2) = -4 = 0xFFFFFFFC
+  LSR #1 → 0x7FFFFFFE = 2147483646  ← WRONG (positive!)
+  ASR #1 → 0xFFFFFFFE = -2          ← correct
+```
+
+### Test 3 — Range (32-bit overflow)
+
+```
+N=2, X=[0, 4], Y=[0, 0xC0000000]  (Y[1] = -1073741824 signed)
+
+dx=4 → sum_y = 0 + 0xC0000000 = 0xC0000000
+        sum_y << 1 = 0x80000000     ← LSL #1 (net factor = dx/2 = 2)
+        accum_done = 0x80000000
+
+Result = 0x80000000 = -2147483648
+
+Expected output: -2147483648
+Wrong if student gets: 0  (used LSL #2 then LSR #1 — overflow!)
+```
+
+**What goes wrong with the naive approach:**
+```
+sum_y = 0xC0000000
+LSL #2 → 0x00000000   ← top bits shifted out! OVERFLOW!
+Then ASR #1 → 0       ← wrong
+
+Correct (two-accum):
+LSL #1 → 0x80000000   ← dx/2 = 2, only shift by 1
+Result = 0x80000000 = -2147483648  ✓
+```
+
+### Summary: What Each Test Catches
+
+| Test | Catches students who... | Wrong answer | Correct |
+|------|------------------------|--------------|---------|
+| Test 1 | Forget rounding (`AND #1` + add) | 41675 | **41676** |
+| Test 2 | Use LSR instead of ASR for /2 | 2147483646 | **-2** |
+| Test 3 | Use `LSL #2` then `/2` instead of net `LSL #1` | 0 | **-2147483648** |
 
 ---
 
@@ -485,10 +588,11 @@ All test cases: **y = x²**, theoretical integral = x³/3.
 1. **Using MUL** — forbidden; must use LSL
 2. **Assuming constant dx** — only works for DS4; DS5/DS6 have varying dx
 3. **Loop runs N times instead of N-1** — N points = N-1 trapezoids
-4. **Dividing by 2 inside the loop** — loses fractional precision each iteration
-5. **Not rounding up** — if raw sum is odd, LSR truncates; must add 1
-6. **LSR vs LSL confusion** — LSL multiplies (shift left), LSR divides (shift right)
+4. **Not rounding up** — if raw sum is odd, the shift truncates; must `AND #1` then add
+5. **Using LSR instead of ASR for /2** — LSR clears the sign bit, turning negatives positive (Test 2 catches this)
+6. **Using `LSL #2` for dx=4** — overflows for large values; must fold `/2` into the shift: use `LSL #1` (net factor = dx/2 = 2). Test 3 catches this.
 7. **Only advancing Y pointer, forgetting X** — both must `add #4` each iteration
+8. **Dividing by 2 per iteration for all dx** — loses fractional precision when dx=1; accumulate raw for dx=1 and divide once at end
 
 ---
 
